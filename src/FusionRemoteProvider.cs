@@ -1,9 +1,9 @@
+using AnotherECS.ArrayPool;
 using AnotherECS.Core;
 using AnotherECS.Core.Remote;
 using Fusion;
+using System;
 using System.Collections.Generic;
-using System.Data;
-using System.Linq;
 using System.Threading.Tasks;
 using UnityEngine;
 
@@ -24,7 +24,8 @@ namespace AnotherECS.Remote.Fusion
 
         private StartGameArgs _args;
         private NetworkTransfer _networkTransfer;
-        private Cache<Player[]> _players;
+        private SmallArrayPoolAccuracy<Player> _playerPool;
+        private Player[] _players;
         private Cache<NetworkRunner> _networkRunner;
         private Dictionary<long, Player> _playerDetails;
 
@@ -35,11 +36,12 @@ namespace AnotherECS.Remote.Fusion
 
         private void Awake()
         {
-            _players = new Cache<Player[]>(() => GetRunner().ActivePlayers.Select(p => ConvertToPlayer(p)).ToArray());
             _networkRunner = new Cache<NetworkRunner>(() => GetComponent<NetworkRunner>());
             _playerDetails = new Dictionary<long, Player>();
             _callbackBuffer = new Queue<PlayerRef>();
             _networkTransfer = new NetworkTransfer(this);
+            _playerPool = new SmallArrayPoolAccuracy<Player>(2);
+            _players = _playerPool.Empty();
         }
 
         public async Task<ConnectResult> Connect()
@@ -76,12 +78,11 @@ namespace AnotherECS.Remote.Fusion
             => ConvertToPlayer(GetLocalPlayerRef());
 
         public Player[] GetPlayers()
-            => _players.Get();
+            => _players;
 
 
         internal void OnConnectPlayer(PlayerRef player)
         {
-            _players.Drop();
             _callbackBuffer.Enqueue(player);
 
             if (player == GetLocalPlayerRef())
@@ -95,18 +96,26 @@ namespace AnotherECS.Remote.Fusion
             }
         }
 
-        internal void OnDisconnectPlayer(PlayerRef player)
+        internal void OnDisconnectPlayer(PlayerRef sender)
         {
-            _players.Drop();
-            
-            DisconnectPlayer.Invoke(ConvertToPlayer(player));
-            _playerDetails.Remove(player.PlayerId);
+            var player = ConvertToPlayer(sender);
+            DisconnectPlayer.Invoke(player);
+
+            lock (_playerDetails)
+            {
+                _playerDetails.Remove(sender.PlayerId);
+            }
+            RemovePlayer(player);
         }
 
         internal void OnReceivePlayerData(PlayerRef sender, PlayerData playerData)
         {
-            _players.Drop();
-            _playerDetails[sender.PlayerId] = new Player(sender.PlayerId, sender == GetLocalPlayerRef(), playerData.role, playerData.performanceTiming);
+            var player = new Player(sender.PlayerId, sender == GetLocalPlayerRef(), playerData.role, playerData.performanceTiming);
+            lock (_playerDetails)
+            {
+                _playerDetails[sender.PlayerId] = player;
+            }
+            UpdatePlayer(player);
             CallbackBufferFlush();
         }
 
@@ -134,9 +143,14 @@ namespace AnotherECS.Remote.Fusion
             => GetRunner().LocalPlayer;
 
         private Player ConvertToPlayer(PlayerRef player)
-            => _playerDetails.TryGetValue(player.PlayerId, out var result)
-                ? result
-                : new Player(player.PlayerId, false, ClientRole.Unknow, -1);
+        {
+            lock (_playerDetails)
+            {
+                return _playerDetails.TryGetValue(player.PlayerId, out var result)
+                    ? result
+                    : new Player(player.PlayerId, false, ClientRole.Unknow, -1);
+            }
+        }
 
         private PlayerData GetPlayerData()
             => new()
@@ -152,15 +166,65 @@ namespace AnotherECS.Remote.Fusion
         {
             while (_callbackBuffer.Count != 0)
             {
-                var player = _callbackBuffer.Peek();
-                if (_playerDetails.ContainsKey(player.PlayerId))
+                var playerRef = _callbackBuffer.Peek();
+
+                bool isHasPlayer = false;
+                Player player = default;
+                lock (_playerDetails)
+                {
+                    isHasPlayer = _playerDetails.TryGetValue(playerRef.PlayerId, out player);
+                }
+                if (isHasPlayer)
                 {
                     _callbackBuffer.Dequeue();
-                    ConnectPlayer.Invoke(ConvertToPlayer(player));
+                    ConnectPlayer.Invoke(player);
                 }
                 else
                 {
                     break;
+                }
+            }
+        }
+
+        private void UpdatePlayer(Player player)
+        {
+            lock (_players)
+            {
+                for (int i = 0; i < _players.Length; ++i)
+                {
+                    if (_players[i].Id == player.Id)
+                    {
+                        _players[i] = player;
+                        return;
+                    }
+                }
+                var players = _playerPool.Get(_players.Length + 1);
+                Array.Copy(_players, players, _players.Length);
+                players[^1] = player;
+                _players = players;
+            }
+        }
+
+        private void RemovePlayer(Player player)
+        {
+            int index = -1;
+            lock (_players)
+            {
+                for (int i = 0; i < _players.Length; ++i)
+                {
+                    if (_players[i].Id == player.Id)
+                    {
+                        index = i;
+                    }
+                }
+
+                if (index != -1)
+                {
+                    var players = _playerPool.Get(_players.Length - 1);
+
+                    Array.Copy(_players, 0, players, 0, index);
+                    Array.Copy(_players, index + 1, players, index, _players.Length - index - 1);
+                    _players = players;
                 }
             }
         }
