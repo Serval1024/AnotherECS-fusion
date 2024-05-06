@@ -80,6 +80,8 @@ namespace AnotherECS.Remote.Fusion
         public Player[] GetPlayers()
             => _players;
 
+        public double GetPing()
+            => GetRunner().GetPlayerRtt(GetRunner().LocalPlayer);
 
         internal void OnConnectPlayer(PlayerRef player)
         {
